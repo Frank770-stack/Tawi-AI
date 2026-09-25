@@ -1,0 +1,166 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum OrgType {
+  FARM
+  EXPORTER
+}
+
+enum OrderStatus {
+  NEW
+  AWAITING_CONFIRMATION
+  CONFIRMED
+  FULFILLED
+}
+
+enum RequestStatus {
+  PENDING
+  CONFIRMED
+  PARTIAL
+  REJECTED
+  EXPIRED
+}
+
+model Organization {
+  id            String   @id @default(cuid())
+  name          String
+  type          OrgType
+  contactPerson String
+  phone         String // +254XXXXXXXXX
+  location      String? // farms only, e.g. "Naivasha"
+  createdAt     DateTime @default(now())
+
+  users         User[]
+  varieties     Variety[]
+  stockEntries  StockEntry[]
+  orders        Order[] // when EXPORTER
+  requests      AllocationRequest[] // when FARM
+  notifications Notification[]
+}
+
+model User {
+  id             String        @id @default(cuid())
+  phone          String        @unique // always normalised to +254
+  name           String? // null until profile is completed
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  createdAt      DateTime      @default(now())
+  sessions       Session[]
+}
+
+model OtpCode {
+  id         String    @id @default(cuid())
+  phone      String
+  codeHash   String // sha256, never the raw code
+  expiresAt  DateTime
+  attempts   Int       @default(0)
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([phone, createdAt])
+}
+
+model Session {
+  id        String   @id // sha256 of the cookie token
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+model Variety {
+  id         String       @id @default(cuid())
+  farmId     String
+  farm       Organization @relation(fields: [farmId], references: [id])
+  name       String // from VARIETY_NAMES
+  archivedAt DateTime? // "remove" = archive, keeps history
+  createdAt  DateTime     @default(now())
+
+  stockEntries StockEntry[]
+  requests     AllocationRequest[]
+
+  @@unique([farmId, name])
+}
+
+model StockEntry {
+  id         String       @id @default(cuid())
+  farmId     String
+  farm       Organization @relation(fields: [farmId], references: [id])
+  varietyId  String
+  variety    Variety      @relation(fields: [varietyId], references: [id])
+  quantity   Int // stems
+  location   String
+  loggedAt   DateTime     @default(now())
+  loggedById String
+
+  @@index([varietyId, loggedAt])
+}
+
+model Order {
+  id                String       @id @default(cuid())
+  exporterId        String
+  exporter          Organization @relation(fields: [exporterId], references: [id])
+  varietyName       String
+  quantity          Int
+  deliveryDate      DateTime     @db.Date
+  buyerName         String
+  buyerContact      String
+  status            OrderStatus  @default(NEW)
+  createdAt         DateTime     @default(now())
+  firstRequestAt    DateTime?
+  confirmedAt       DateTime?
+  fulfilledAt       DateTime?
+  deliveredQuantity Int?
+
+  requests AllocationRequest[]
+
+  @@index([exporterId, status])
+}
+
+model AllocationRequest {
+  id               String        @id @default(cuid())
+  orderId          String
+  order            Order         @relation(fields: [orderId], references: [id])
+  farmId           String // always set server-side from the variety
+  farm             Organization  @relation(fields: [farmId], references: [id])
+  varietyId        String
+  variety          Variety       @relation(fields: [varietyId], references: [id])
+  requestedQty     Int
+  confirmedQty     Int           @default(0)
+  status           RequestStatus @default(PENDING)
+  responseDeadline DateTime
+  requestedAt      DateTime      @default(now())
+  respondedAt      DateTime?
+  expiredAt        DateTime?
+
+  @@index([varietyId, status])
+  @@index([farmId, status, responseDeadline])
+}
+
+model Notification {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  type           String // NEW_REQUEST | FARM_RESPONSE | ORDER_STATUS | REQUEST_EXPIRED
+  message        String
+  link           String
+  readAt         DateTime?
+  createdAt      DateTime     @default(now())
+
+  @@index([organizationId, readAt])
+}
+
+model AccessRequest {
+  id               String   @id @default(cuid())
+  name             String
+  phone            String
+  organizationName String
+  orgType          OrgType
+  createdAt        DateTime @default(now())
+}
