@@ -1,7 +1,14 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { db } from "@/lib/db";
 import { addVariety } from "@/lib/farm";
-import { getStockPositions, lockVariety, logStock, startOfTodayNairobi } from "@/lib/stock";
+import {
+  compareAndSetAllocated,
+  compareAndSetStock,
+  ConflictError,
+  getStockPositions,
+  logStock,
+  startOfTodayNairobi,
+} from "@/lib/stock";
 import { createFarm, resetDb } from "./helpers";
 
 beforeEach(resetDb);
@@ -16,7 +23,10 @@ async function setup() {
   const log = (quantity: number) =>
     logStock({ farmId: farm.id, varietyId: variety.id, quantity, location: "Cold store", userId: "u1" });
 
-  /** A confirmed allocation of `qty` stems on a new order for this variety. */
+  /**
+   * A confirmed allocation of `qty` stems on a new order for this variety,
+   * written the way respondToRequest writes it: the request plus the counter.
+   */
   async function confirmed(qty: number, orderStatus: "CONFIRMED" | "FULFILLED" = "CONFIRMED") {
     const order = await db.order.create({
       data: {
@@ -24,13 +34,19 @@ async function setup() {
         deliveryDate: new Date(), buyerName: "B", buyerContact: "x",
       },
     });
-    return db.allocationRequest.create({
+    const request = await db.allocationRequest.create({
       data: {
         orderId: order.id, farmId: farm.id, varietyId: variety.id, requestedQty: qty,
         confirmedQty: qty, status: "CONFIRMED", responseDeadline: new Date(),
       },
     });
+    // Fulfilled orders hold nothing; everything else counts against ATP.
+    if (orderStatus !== "FULFILLED") {
+      await db.variety.update({ where: { id: variety.id }, data: { allocated: { increment: qty } } });
+    }
+    return request;
   }
+
   return { farm, variety, exporter, log, confirmed };
 }
 
@@ -55,12 +71,22 @@ describe("stock positions", () => {
   });
 
   it("pending and rejected requests don't reduce ATP", async () => {
-    const { farm, variety, log, confirmed } = await setup();
+    const { farm, variety, log } = await setup();
     await log(1000);
-    const req = await confirmed(1);
-    await db.allocationRequest.update({ where: { id: req.id }, data: { confirmedQty: 0, status: "PENDING" } });
+    const exporter = await db.organization.findFirstOrThrow({ where: { type: "EXPORTER" } });
+    const order = await db.order.create({
+      data: {
+        exporterId: exporter.id, varietyName: "Roses", quantity: 400, status: "AWAITING_CONFIRMATION",
+        deliveryDate: new Date(), buyerName: "B", buyerContact: "x",
+      },
+    });
+    await db.allocationRequest.create({
+      data: {
+        orderId: order.id, farmId: variety.farmId, varietyId: variety.id, requestedQty: 400,
+        status: "PENDING", responseDeadline: new Date(Date.now() + 3600_000),
+      },
+    });
     expect((await getStockPositions(farm.id))[0].atp).toBe(1000);
-    expect(variety.id).toBeTruthy();
   });
 
   it("flags stock not updated today", async () => {
@@ -83,7 +109,10 @@ describe("logStock", () => {
     const { log, confirmed } = await setup();
     await log(2000);
     await confirmed(1500);
-    expect(await log(1400)).toMatchObject({ ok: false, error: expect.stringMatching(/1,500 stems are already promised/) });
+    expect(await log(1400)).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/1,500 stems are already promised/),
+    });
     expect(await log(1500)).toEqual({ ok: true }); // exactly allocated is fine (ATP 0)
   });
 
@@ -104,31 +133,56 @@ describe("logStock", () => {
     expect(res2.ok).toBe(false);
   });
 
-  it("waits for a concurrent confirmation's lock, then refuses to drop below the new allocation", async () => {
-    const { variety, log, confirmed } = await setup();
+  it("keeps the stock counter and the history entry in step", async () => {
+    const { variety, log } = await setup();
+    await log(2500);
+    const saved = await db.variety.findUniqueOrThrow({ where: { id: variety.id } });
+    const entry = await db.stockEntry.findFirstOrThrow({ where: { varietyId: variety.id } });
+    expect(saved.stock).toBe(2500);
+    expect(entry.quantity).toBe(2500);
+  });
+});
+
+describe("compare-and-set", () => {
+  it("refuses a write based on numbers that have since changed", async () => {
+    const { variety, log } = await setup();
     await log(1000);
-    // An 800-stem request that isn't confirmed yet; A confirms it inside the lock.
-    const req = await confirmed(800);
-    await db.allocationRequest.update({ where: { id: req.id }, data: { confirmedQty: 0, status: "PENDING" } });
+    const stale = await db.variety.findUniqueOrThrow({ where: { id: variety.id } });
 
-    // Transaction A: take the variety lock, confirm 800 stems, hold the lock a moment.
-    let lockTaken!: () => void;
-    const locked = new Promise<void>((r) => (lockTaken = r));
-    const confirmation = db.$transaction(async (tx) => {
-      await lockVariety(tx, variety.id);
-      lockTaken();
-      await tx.allocationRequest.update({ where: { id: req.id }, data: { confirmedQty: 800, status: "CONFIRMED" } });
-      await new Promise((r) => setTimeout(r, 300));
-    });
+    // Someone else confirms 900 stems first.
+    await db.variety.update({ where: { id: variety.id }, data: { allocated: 900 } });
 
-    // Transaction B: starts while A holds the lock and tries to drop stock to 500.
-    await locked;
-    const stockUpdate = log(500);
+    // Our write was validated against allocated 0, so it must not apply.
+    await expect(
+      compareAndSetAllocated(db, {
+        varietyId: variety.id,
+        expectedStock: stale.stock,
+        expectedAllocated: stale.allocated,
+        delta: 800,
+      }),
+    ).rejects.toBeInstanceOf(ConflictError);
 
-    await confirmation;
-    expect(await stockUpdate).toMatchObject({ ok: false, error: expect.stringMatching(/800 stems/) });
-    const latest = await db.stockEntry.findFirstOrThrow({ where: { varietyId: variety.id }, orderBy: { loggedAt: "desc" } });
-    expect(latest.quantity).toBe(1000);
+    expect((await db.variety.findUniqueOrThrow({ where: { id: variety.id } })).allocated).toBe(900);
+  });
+
+  it("never lets allocated pass stock, even when asked directly", async () => {
+    const { variety, log } = await setup();
+    await log(1000);
+    await expect(
+      compareAndSetAllocated(db, {
+        varietyId: variety.id,
+        expectedStock: 1000,
+        expectedAllocated: 0,
+        delta: 1001,
+      }),
+    ).rejects.toBeInstanceOf(ConflictError);
+
+    await expect(
+      compareAndSetStock(db, { varietyId: variety.id, expectedStock: 1000, expectedAllocated: 0, stock: -5 }),
+    ).rejects.toBeInstanceOf(ConflictError);
+
+    const saved = await db.variety.findUniqueOrThrow({ where: { id: variety.id } });
+    expect(saved.allocated).toBeLessThanOrEqual(saved.stock);
   });
 });
 

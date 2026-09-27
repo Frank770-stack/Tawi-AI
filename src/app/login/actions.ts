@@ -43,7 +43,7 @@ export async function loginAction(_prev: LoginState, formData: FormData): Promis
 
     const user = await db.user.upsert({
       where: { phone },
-      create: { phone },
+      create: { phone, name: null, organizationId: null },
       update: {},
       include: { organization: true },
     });

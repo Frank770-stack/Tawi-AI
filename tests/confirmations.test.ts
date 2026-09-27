@@ -316,6 +316,20 @@ describe("fulfilling an order", () => {
   });
 });
 
+/**
+ * Two things stop the same stems being promised twice, and both are exercised
+ * here:
+ *
+ *  1. MongoDB aborts one side of a write conflict inside a transaction, so the
+ *     loser retries and re-reads. These tests cover that path.
+ *  2. Our own compare-and-set on the variety document, which refuses a write
+ *     based on numbers that have since changed. That is covered directly by
+ *     the "compare-and-set" tests in stock.test.ts, which fail if the
+ *     condition is removed.
+ *
+ * Keep both. The first is MongoDB behaviour we do not control; the second is
+ * ours, and it also guards any path that is not inside a transaction.
+ */
 describe("the invariant under concurrency", () => {
   it("two exporters confirming the same stems at the same moment: only one wins", async () => {
     const { variety, request, respond, atp } = await scenario(1000);
@@ -351,8 +365,15 @@ describe("the invariant under concurrency", () => {
     const results = await Promise.all(
       requests.map((r) => respond(r.requestId, "CONFIRM", undefined, { afterReadingAtp: all })),
     );
+    // Nobody can win more than three times: 3 x 300 = 900 fits, a fourth would
+    // exceed 1,000. Some may have lost a race rather than run out of stock, so
+    // retry the losers one at a time; the end state must still be exactly 3.
+    expect(results.filter((r) => r.ok).length).toBeLessThanOrEqual(3);
+    for (let i = 0; i < requests.length; i++) {
+      if (!results[i].ok) results[i] = await respond(requests[i].requestId, "CONFIRM");
+    }
     const okCount = results.filter((r) => r.ok).length;
-    expect(okCount).toBe(3); // 3 × 300 = 900 fits, the 4th would exceed 1000
+    expect(okCount).toBe(3);
 
     const confirmed = await db.allocationRequest.aggregate({
       where: { varietyId: variety.id },

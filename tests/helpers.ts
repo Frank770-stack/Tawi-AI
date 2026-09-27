@@ -1,10 +1,22 @@
 import { db } from "@/lib/db";
 
-/** Empties every table. Call in beforeEach. */
+/**
+ * Empties every collection. Call in beforeEach. Children are deleted before
+ * their parents, because Prisma enforces relations on MongoDB too. Independent
+ * collections go together to save round trips to Atlas.
+ */
 export async function resetDb() {
-  await db.$executeRawUnsafe(`
-    TRUNCATE "Notification", "AllocationRequest", "Order", "StockEntry", "Variety",
-             "Session", "OtpCode", "User", "Organization", "AccessRequest" CASCADE`);
+  await Promise.all([
+    db.notification.deleteMany(),
+    db.allocationRequest.deleteMany(),
+    db.otpCode.deleteMany(),
+    db.session.deleteMany(),
+    db.accessRequest.deleteMany(),
+  ]);
+  await Promise.all([db.order.deleteMany(), db.stockEntry.deleteMany()]);
+  await db.variety.deleteMany();
+  await db.user.deleteMany();
+  await db.organization.deleteMany();
 }
 
 export async function createFarm(name = "Test Farm") {

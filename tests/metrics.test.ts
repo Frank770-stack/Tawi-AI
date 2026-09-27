@@ -140,21 +140,19 @@ describe("duplicate promise check", () => {
     const a = await order(1000);
     await respondToRequest({ farmId: farm.id, requestId: a.requestId, action: "CONFIRM" });
 
-    // Break the invariant behind the app's back, as a bug or bad data would.
-    await db.stockEntry.create({
-      data: {
-        farmId: farm.id,
-        varietyId: (await db.variety.findFirstOrThrow()).id,
-        quantity: 400,
-        location: "Store",
-        loggedById: "u",
-      },
+    // Break the invariant behind the app's back, as a bug or bad data would:
+    // drop the stock counter below what is already promised.
+    await db.variety.update({
+      where: { id: (await db.variety.findFirstOrThrow()).id },
+      data: { stock: 400 },
     });
 
     const found = await findDuplicatePromises();
-    expect(found).toHaveLength(1);
-    expect(found[0]).toMatchObject({ kind: "OVER_PROMISED_STOCK", promised: 1000, limit: 400 });
-    expect(found[0].label).toContain("Naivasha Roses");
+    const overStock = found.filter((f) => f.kind === "OVER_PROMISED_STOCK");
+    expect(overStock).toHaveLength(1);
+    expect(overStock[0]).toMatchObject({ promised: 1000, limit: 400 });
+    expect(overStock[0].label).toContain("Naivasha Roses");
+    expect(farm.id).toBeTruthy();
   });
 
   it("catches an order confirmed beyond its quantity", async () => {
@@ -167,8 +165,12 @@ describe("duplicate promise check", () => {
     });
 
     const found = await findDuplicatePromises();
-    expect(found).toHaveLength(1);
-    expect(found[0]).toMatchObject({ kind: "OVER_CONFIRMED_ORDER", promised: 900, limit: 500 });
+    const overOrder = found.filter((f) => f.kind === "OVER_CONFIRMED_ORDER");
+    expect(overOrder).toHaveLength(1);
+    expect(overOrder[0]).toMatchObject({ promised: 900, limit: 500 });
+    // Editing the request without the counter also shows up as drift, which is
+    // exactly what that check is for.
+    expect(found.some((f) => f.kind === "COUNTER_DRIFT")).toBe(true);
   });
 
   it("ignores stock released by fulfilled orders", async () => {
@@ -185,5 +187,25 @@ describe("duplicate promise check", () => {
       userId: "u",
     });
     expect(await findDuplicatePromises()).toEqual([]);
+  });
+});
+
+describe("counter drift check", () => {
+  it("catches an allocated counter that disagrees with the confirmed requests", async () => {
+    const { farm, order } = await scenario(5000);
+    const a = await order(600);
+    await respondToRequest({ farmId: farm.id, requestId: a.requestId, action: "CONFIRM" });
+    expect(await findDuplicatePromises()).toEqual([]);
+
+    // Corrupt the counter directly; the requests still say 600.
+    await db.variety.update({
+      where: { id: (await db.variety.findFirstOrThrow()).id },
+      data: { allocated: 900 },
+    });
+
+    const found = await findDuplicatePromises();
+    const drift = found.filter((f) => f.kind === "COUNTER_DRIFT");
+    expect(drift).toHaveLength(1);
+    expect(drift[0]).toMatchObject({ promised: 900, limit: 600 });
   });
 });

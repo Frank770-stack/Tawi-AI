@@ -10,7 +10,7 @@ export async function notify(
   tx: Tx,
   input: { organizationId: string; type: NotificationType; message: string; link: string },
 ) {
-  await tx.notification.create({ data: input });
+  await tx.notification.create({ data: { ...input, readAt: null } });
 }
 
 export async function unreadCount(organizationId: string) {

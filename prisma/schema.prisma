@@ -3,7 +3,7 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
+  provider = "mongodb"
   url      = env("DATABASE_URL")
 }
 
@@ -28,7 +28,7 @@ enum RequestStatus {
 }
 
 model Organization {
-  id            String   @id @default(cuid())
+  id            String   @id @default(auto()) @map("_id") @db.ObjectId
   name          String
   type          OrgType
   contactPerson String
@@ -45,17 +45,17 @@ model Organization {
 }
 
 model User {
-  id             String        @id @default(cuid())
+  id             String        @id @default(auto()) @map("_id") @db.ObjectId
   phone          String        @unique // always normalised to +254
   name           String? // null until profile is completed
-  organizationId String?
+  organizationId String?       @db.ObjectId
   organization   Organization? @relation(fields: [organizationId], references: [id])
   createdAt      DateTime      @default(now())
   sessions       Session[]
 }
 
 model OtpCode {
-  id         String    @id @default(cuid())
+  id         String    @id @default(auto()) @map("_id") @db.ObjectId
   phone      String
   codeHash   String // sha256, never the raw code
   expiresAt  DateTime
@@ -67,20 +67,28 @@ model OtpCode {
 }
 
 model Session {
-  id        String   @id // sha256 of the cookie token
-  userId    String
+  id        String   @id @map("_id") // sha256 of the cookie token
+  userId    String   @db.ObjectId
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   expiresAt DateTime
   createdAt DateTime @default(now())
 }
 
 model Variety {
-  id         String       @id @default(cuid())
-  farmId     String
-  farm       Organization @relation(fields: [farmId], references: [id])
-  name       String // from VARIETY_NAMES
+  id     String       @id @default(auto()) @map("_id") @db.ObjectId
+  farmId String       @db.ObjectId
+  farm   Organization @relation(fields: [farmId], references: [id])
+  name   String // from VARIETY_NAMES
+
+  /// Latest logged stock. StockEntry keeps the history.
+  stock Int @default(0)
+  /// Stems confirmed to exporters on orders that aren't fulfilled yet.
+  /// Kept here so a single atomic document update can guard the invariant:
+  /// allocated must never exceed stock. /metrics re-derives it as a check.
+  allocated Int @default(0)
+
   archivedAt DateTime? // "remove" = archive, keeps history
-  createdAt  DateTime     @default(now())
+  createdAt  DateTime  @default(now())
 
   stockEntries StockEntry[]
   requests     AllocationRequest[]
@@ -89,10 +97,10 @@ model Variety {
 }
 
 model StockEntry {
-  id         String       @id @default(cuid())
-  farmId     String
+  id         String       @id @default(auto()) @map("_id") @db.ObjectId
+  farmId     String       @db.ObjectId
   farm       Organization @relation(fields: [farmId], references: [id])
-  varietyId  String
+  varietyId  String       @db.ObjectId
   variety    Variety      @relation(fields: [varietyId], references: [id])
   quantity   Int // stems
   location   String
@@ -103,12 +111,12 @@ model StockEntry {
 }
 
 model Order {
-  id                String       @id @default(cuid())
-  exporterId        String
+  id                String       @id @default(auto()) @map("_id") @db.ObjectId
+  exporterId        String       @db.ObjectId
   exporter          Organization @relation(fields: [exporterId], references: [id])
   varietyName       String
   quantity          Int
-  deliveryDate      DateTime     @db.Date
+  deliveryDate      DateTime
   buyerName         String
   buyerContact      String
   status            OrderStatus  @default(NEW)
@@ -124,12 +132,12 @@ model Order {
 }
 
 model AllocationRequest {
-  id               String        @id @default(cuid())
-  orderId          String
+  id               String        @id @default(auto()) @map("_id") @db.ObjectId
+  orderId          String        @db.ObjectId
   order            Order         @relation(fields: [orderId], references: [id])
-  farmId           String // always set server-side from the variety
+  farmId           String        @db.ObjectId // always set server-side from the variety
   farm             Organization  @relation(fields: [farmId], references: [id])
-  varietyId        String
+  varietyId        String        @db.ObjectId
   variety          Variety       @relation(fields: [varietyId], references: [id])
   requestedQty     Int
   confirmedQty     Int           @default(0)
@@ -144,8 +152,8 @@ model AllocationRequest {
 }
 
 model Notification {
-  id             String       @id @default(cuid())
-  organizationId String
+  id             String       @id @default(auto()) @map("_id") @db.ObjectId
+  organizationId String       @db.ObjectId
   organization   Organization @relation(fields: [organizationId], references: [id])
   type           String // NEW_REQUEST | FARM_RESPONSE | ORDER_STATUS | REQUEST_EXPIRED
   message        String
@@ -157,7 +165,7 @@ model Notification {
 }
 
 model AccessRequest {
-  id               String   @id @default(cuid())
+  id               String   @id @default(auto()) @map("_id") @db.ObjectId
   name             String
   phone            String
   organizationName String

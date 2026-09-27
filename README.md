@@ -4,17 +4,19 @@ Coordinates cut-flower supply between Kenyan farms and exporters: real-time
 available-to-promise (ATP) stock per farm, and a fast farm confirmation flow that
 locks stock so the same flowers are never promised to two buyers.
 
-Stack: Next.js (App Router) + TypeScript, PostgreSQL + Prisma, Tailwind CSS.
+Stack: Next.js (App Router) + TypeScript, MongoDB Atlas + Prisma, Tailwind CSS.
 Mobile-first: farm managers use it on phones in the field.
 
 ## Setup
 
-Requirements: Node 20.19+ / 22.12+ and a PostgreSQL database (Neon, Supabase or local).
+Requirements: Node 20.19+ / 22.12+ and a MongoDB Atlas cluster. It must be a
+replica set (every Atlas cluster is, including the free tier), because the
+confirmation flow needs transactions.
 
 ```bash
 npm install
 cp .env.example .env        # then fill in the values below
-npx prisma migrate dev      # create the tables
+npm run db:push             # create collections and indexes
 npm run db:seed             # 5 farms, 2 exporters, varieties, stock
 npm run dev                 # http://localhost:3000
 ```
@@ -26,7 +28,7 @@ In dev mode (`SMS_MODE=console`), login codes are printed in the terminal runnin
 
 | Variable | Purpose |
 | --- | --- |
-| `DATABASE_URL` | Postgres connection string. On Vercel use the pooled URL from Neon/Supabase. |
+| `DATABASE_URL` | MongoDB Atlas connection string, including the database name (`/tawi`). |
 | `TEST_DATABASE_URL` | A **separate** database for tests. Tests wipe it. |
 | `SMS_MODE` | `console` (default, logs the OTP) or `africastalking` (sends real SMS). |
 | `AFRICASTALKING_USERNAME` | Africa's Talking username. `sandbox` uses the sandbox API. |
@@ -53,43 +55,70 @@ To see `/metrics` locally, put one of those phones in `INTERNAL_PHONES`.
 npm test
 ```
 
-Tests run against real Postgres (`TEST_DATABASE_URL`), because the stock-locking
-guarantees can only be tested on a real database. Migrations are applied to the
-test database automatically before the run.
+Tests run against a real MongoDB database (`TEST_DATABASE_URL`), because the
+safety guarantees can only be tested on a real database. The schema is pushed
+to the test database automatically before the run.
+
+They are slow: every query is a network round trip to Atlas, so the full suite
+takes several minutes. Run one file while working, e.g.
+`npx vitest run tests/confirmations.test.ts`.
 
 The concurrency tests in `tests/confirmations.test.ts` are the important ones:
 they make transactions genuinely overlap and check that simultaneous
-confirmations can never promise the same stems twice. Removing the row locks
-makes them fail.
+confirmations can never promise the same stems twice.
 
 ## The invariant
 
 **For any farm + variety, confirmed allocations can never exceed logged stock.**
 
-- ATP = latest logged stock − confirmed quantities on orders that aren't fulfilled.
-- Every write that can break this (a farm confirming, a farm logging new stock,
-  an exporter sending requests) runs in one transaction that takes `SELECT …
-  FOR UPDATE` row locks in a fixed order: order, then variety, then request.
-- ATP is always recomputed from the database inside those locks. Numbers from
-  the browser are never trusted.
+Each `Variety` document carries two counters: `stock` (the latest logged count)
+and `allocated` (stems confirmed on orders that aren't fulfilled). ATP is
+`stock - allocated`.
+
+MongoDB has no row locks, so the guarantee rests on **atomic compare-and-set**:
+
+- Every write that can break the invariant (a farm confirming, a farm logging
+  new stock, an order being delivered) runs inside a transaction, and updates
+  the variety document with a condition pinning `stock` and `allocated` to the
+  exact values it validated against (`src/lib/stock.ts`).
+- MongoDB applies a single document update atomically, so the check and the
+  write cannot interleave. If anything changed underneath, nothing is written,
+  and the caller retries against fresh numbers or is refused.
+- `compareAndSetAllocated` also refuses outright if the new total would exceed
+  stock, so the invariant cannot be broken even by a direct call.
+- ATP is always recomputed from the database. Numbers from the browser are
+  never trusted.
 - Logging stock below what is already promised is refused.
 - Marking an order fulfilled releases its allocations.
 - `/metrics` runs a live integrity check that should always show 0 duplicate
-  promises.
+  promises. It covers three cases: allocated above stock, an order confirmed
+  beyond its quantity, and the `allocated` counter drifting away from the
+  confirmed requests it is derived from.
+
+### MongoDB gotcha worth knowing
+
+Prisma omits nullable fields it isn't given, and a `{ field: null }` filter does
+**not** match a document where the field is missing. Every create therefore
+writes explicit nulls for fields that are later filtered on null (`consumedAt`,
+`archivedAt`, `readAt`, `organizationId`). Leaving one out silently breaks those
+queries; there's a note in `src/lib/db.ts`.
 
 ## Database
 
-- Schema: `prisma/schema.prisma`. Migrations: `prisma/migrations/`.
-- The init migration adds hand-written `CHECK` constraints (non-negative stock,
-  confirmed ≤ requested) that Prisma can't express.
-- Production: `npm run db:deploy` applies migrations without prompting.
+- Schema: `prisma/schema.prisma`. MongoDB has no migrations: `npm run db:push`
+  syncs collections and indexes.
+- Run `npm run db:push` after changing the schema, including against production.
+- MongoDB has no CHECK constraints, so the equivalent rules (non-negative stock,
+  confirmed ≤ requested, allocated ≤ stock) are enforced in application code and
+  re-checked by the integrity check on `/metrics`.
 
-## Deploying (Vercel + Neon/Supabase)
+## Deploying (Vercel + MongoDB Atlas)
 
-1. Create the database and copy its connection strings.
+1. In Atlas, allow Vercel to connect (Network Access). Vercel's IPs are not
+   fixed, so the pilot uses `0.0.0.0/0` with a strong database password.
 2. Set the env vars above in Vercel. Set `SMS_MODE=africastalking` for real SMS.
-3. Run `npm run db:deploy` against the production `DATABASE_URL` once per release
-   (or add it to the build command).
+3. Run `npm run db:push` against the production `DATABASE_URL` after any schema
+   change.
 
 ## Auth
 
@@ -119,9 +148,10 @@ makes them fail.
 ## Project layout
 
 ```
-prisma/            schema, migrations, seed.ts
+prisma/            schema.prisma, seed.ts
 src/app/           pages and server actions (farm/, exporter/, login/, onboarding/, metrics/)
-src/lib/           db, auth, otp, sms, phone, stock, allocations, confirmations, metrics
+src/lib/           db, auth, otp, sms, phone, stock (compare-and-set), allocations,
+                   confirmations, metrics
 src/components/    small shared UI pieces
 tests/             Vitest tests (need TEST_DATABASE_URL)
 ```

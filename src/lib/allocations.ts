@@ -1,6 +1,6 @@
 import type { Prisma } from "@prisma/client";
-import { db } from "./db";
-import { allocatedQty, latestStock, startOfTodayNairobi } from "./stock";
+import { db, TX_OPTIONS } from "./db";
+import { startOfTodayNairobi } from "./stock";
 import { notify } from "./notifications";
 
 type Tx = Prisma.TransactionClient;
@@ -47,13 +47,16 @@ export type OrderPosition = {
 
 /** Totals for one order. Run expireOverdueRequests first for a current view. */
 export async function getOrderPosition(tx: Tx, orderId: string): Promise<OrderPosition> {
-  const order = await tx.order.findUniqueOrThrow({ where: { id: orderId } });
-  const rows = await tx.$queryRaw<{ confirmed: number; pending: number }[]>`
-    SELECT
-      COALESCE(SUM("confirmedQty"), 0)::int AS confirmed,
-      COALESCE(SUM(CASE WHEN status = 'PENDING' THEN "requestedQty" ELSE 0 END), 0)::int AS pending
-    FROM "AllocationRequest" WHERE "orderId" = ${orderId}`;
-  const { confirmed, pending } = rows[0];
+  const [order, requests] = await Promise.all([
+    tx.order.findUniqueOrThrow({ where: { id: orderId } }),
+    tx.allocationRequest.findMany({
+      where: { orderId },
+      select: { confirmedQty: true, requestedQty: true, status: true },
+    }),
+  ]);
+
+  const confirmed = requests.reduce((sum, r) => sum + r.confirmedQty, 0);
+  const pending = requests.reduce((sum, r) => sum + (r.status === "PENDING" ? r.requestedQty : 0), 0);
   return {
     quantity: order.quantity,
     confirmed,
@@ -77,33 +80,31 @@ export type CandidateFarm = {
 /** Farms growing this variety, with what they can still promise. */
 export async function listCandidateFarms(varietyName: string, orderId: string): Promise<CandidateFarm[]> {
   const varieties = await db.variety.findMany({
-    where: { name: varietyName, archivedAt: null, farm: { type: "FARM" } },
-    include: { farm: true },
+    where: { name: varietyName, archivedAt: null, farm: { is: { type: "FARM" } } },
+    include: { farm: true, stockEntries: { orderBy: { loggedAt: "desc" }, take: 1 } },
+  });
+  const pending = await db.allocationRequest.findMany({
+    where: { orderId, status: "PENDING" },
+    select: { varietyId: true, requestedQty: true },
   });
   const today = startOfTodayNairobi();
 
-  const farms = await Promise.all(
-    varieties.map(async (v) => {
-      const [entry, allocated, pending] = await Promise.all([
-        latestStock(db, v.id),
-        allocatedQty(db, v.id),
-        db.allocationRequest.aggregate({
-          where: { orderId, varietyId: v.id, status: "PENDING" },
-          _sum: { requestedQty: true },
-        }),
-      ]);
-      return {
-        farmId: v.farmId,
-        farmName: v.farm.name,
-        location: v.farm.location,
-        varietyId: v.id,
-        atp: (entry?.quantity ?? 0) - allocated,
-        lastUpdated: entry?.loggedAt ?? null,
-        updatedToday: !!entry && entry.loggedAt >= today,
-        pendingForThisOrder: pending._sum.requestedQty ?? 0,
-      };
-    }),
-  );
+  const farms = varieties.map((v) => {
+    const latest = v.stockEntries[0] ?? null;
+    return {
+      farmId: v.farmId,
+      farmName: v.farm.name,
+      location: v.farm.location,
+      varietyId: v.id,
+      atp: v.stock - v.allocated,
+      lastUpdated: latest?.loggedAt ?? null,
+      updatedToday: !!latest && latest.loggedAt >= today,
+      pendingForThisOrder: pending
+        .filter((p) => p.varietyId === v.id)
+        .reduce((sum, p) => sum + p.requestedQty, 0),
+    };
+  });
+
   // Most available first; farms that can't supply anything sink to the bottom.
   return farms.sort((a, b) => b.atp - a.atp || a.farmName.localeCompare(b.farmName));
 }
@@ -135,19 +136,12 @@ export async function sendAllocationRequests(input: {
   const responseDeadline = new Date(now.getTime() + input.deadlineMinutes * 60_000);
 
   return db.$transaction(async (tx) => {
-    // Lock the order first, then the varieties in a fixed order. Every write
-    // that touches allocations takes these locks the same way, so no deadlocks.
-    const locked = await tx.$queryRaw<{ id: string; status: string; varietyName: string }[]>`
-      SELECT id, status, "varietyName" FROM "Order"
-      WHERE id = ${input.orderId} AND "exporterId" = ${input.exporterId} FOR UPDATE`;
-    const order = locked[0];
+    const order = await tx.order.findFirst({
+      where: { id: input.orderId, exporterId: input.exporterId },
+    });
     if (!order) return { ok: false, error: "Order not found." } as const;
     if (order.status === "FULFILLED" || order.status === "CONFIRMED") {
       return { ok: false, error: "This order is already complete." } as const;
-    }
-
-    for (const varietyId of [...lines.map((l) => l.varietyId)].sort()) {
-      await tx.$queryRaw`SELECT id FROM "Variety" WHERE id = ${varietyId} FOR UPDATE`;
     }
 
     const varieties = await tx.variety.findMany({
@@ -182,7 +176,7 @@ export async function sendAllocationRequests(input: {
       where: { id: input.orderId },
       data: {
         status: "AWAITING_CONFIRMATION",
-        firstRequestAt: order.status === "NEW" ? now : undefined,
+        firstRequestAt: order.firstRequestAt ?? now,
       },
     });
 
@@ -198,5 +192,5 @@ export async function sendAllocationRequests(input: {
     }
 
     return { ok: true, count: lines.length } as const;
-  });
+  }, TX_OPTIONS);
 }

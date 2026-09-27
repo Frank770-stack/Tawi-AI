@@ -1,4 +1,4 @@
-import { db } from "./db";
+import { db, TX_OPTIONS } from "./db";
 import { isVarietyName } from "./varieties";
 
 export type Result = { ok: true } | { ok: false; error: string };
@@ -8,7 +8,7 @@ export async function addVariety(farmId: string, name: string): Promise<Result> 
   if (!isVarietyName(name)) return { ok: false, error: "Unknown variety." };
   await db.variety.upsert({
     where: { farmId_name: { farmId, name } },
-    create: { farmId, name },
+    create: { farmId, name, archivedAt: null },
     update: { archivedAt: null },
   });
   return { ok: true };
@@ -16,34 +16,34 @@ export async function addVariety(farmId: string, name: string): Promise<Result> 
 
 /**
  * Removes (archives) a variety. Refused while it has pending requests or stock
- * promised to orders that aren't fulfilled yet. Locks the variety row, the same
- * lock that confirmations take, so the check can't race a confirmation.
+ * promised to orders that aren't fulfilled yet. The archive write is
+ * conditional on the allocated counter still being zero, so it can't race a
+ * confirmation that is committing at the same moment.
  */
 export async function removeVariety(farmId: string, varietyId: string): Promise<Result> {
   return db.$transaction(async (tx) => {
-    const locked = await tx.$queryRaw<{ id: string }[]>`
-      SELECT id FROM "Variety"
-      WHERE id = ${varietyId} AND "farmId" = ${farmId} AND "archivedAt" IS NULL
-      FOR UPDATE`;
-    if (locked.length === 0) return { ok: false, error: "Variety not found." } as const;
+    const variety = await tx.variety.findFirst({
+      where: { id: varietyId, farmId, archivedAt: null },
+    });
+    if (!variety) return { ok: false, error: "Variety not found." } as const;
 
     const openRequests = await tx.allocationRequest.count({
-      where: {
-        varietyId,
-        OR: [
-          { status: "PENDING" },
-          { status: { in: ["CONFIRMED", "PARTIAL"] }, order: { status: { not: "FULFILLED" } } },
-        ],
-      },
+      where: { varietyId, status: "PENDING" },
     });
-    if (openRequests > 0) {
+    if (openRequests > 0 || variety.allocated > 0) {
       return {
         ok: false,
         error: "This variety has open requests or promised stock. Finish those orders first.",
       } as const;
     }
 
-    await tx.variety.update({ where: { id: varietyId }, data: { archivedAt: new Date() } });
+    const { count } = await tx.variety.updateMany({
+      where: { id: varietyId, allocated: 0, archivedAt: null },
+      data: { archivedAt: new Date() },
+    });
+    if (count === 0) {
+      return { ok: false, error: "This variety was just promised to an exporter. Try again." } as const;
+    }
     return { ok: true } as const;
-  });
+  }, TX_OPTIONS);
 }

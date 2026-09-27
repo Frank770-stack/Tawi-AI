@@ -7,6 +7,7 @@ import {
   sendAllocationRequests,
 } from "@/lib/allocations";
 import { addVariety } from "@/lib/farm";
+import { respondToRequest } from "@/lib/confirmations";
 import { logStock } from "@/lib/stock";
 import { nairobiDateISO } from "@/lib/format";
 import { createOrder } from "@/lib/orders";
@@ -59,10 +60,7 @@ describe("listCandidateFarms", () => {
     await db.variety.update({ where: { id: b.variety.id }, data: { archivedAt: new Date() } });
     await send([{ varietyId: a.variety.id, quantity: 500 }]);
     const req = await db.allocationRequest.findFirstOrThrow({ where: { varietyId: a.variety.id } });
-    await db.allocationRequest.update({
-      where: { id: req.id },
-      data: { status: "CONFIRMED", confirmedQty: 500 },
-    });
+    await respondToRequest({ farmId: a.farm.id, requestId: req.id, action: "CONFIRM" });
 
     const farms = await listCandidateFarms(order.varietyName, order.id);
     expect(farms.map((f) => f.farmName)).toEqual(["Farm A"]);

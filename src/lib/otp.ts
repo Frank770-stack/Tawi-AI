@@ -26,7 +26,12 @@ export async function requestOtp(
 
   const code = randomInt(0, 1_000_000).toString().padStart(6, "0");
   await db.otpCode.create({
-    data: { phone, codeHash: hashCode(phone, code), expiresAt: new Date(Date.now() + OTP_TTL_MS) },
+    data: {
+      phone,
+      codeHash: hashCode(phone, code),
+      expiresAt: new Date(Date.now() + OTP_TTL_MS),
+      consumedAt: null, // explicit: see the note in db.ts
+    },
   });
   await sender.send(phone, `Your Tawi login code is ${code}. It expires in 5 minutes.`);
   return { ok: true };

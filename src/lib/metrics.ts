@@ -14,121 +14,108 @@ export type Metrics = {
 };
 
 export type DuplicatePromise = {
-  kind: "OVER_PROMISED_STOCK" | "OVER_CONFIRMED_ORDER";
+  kind: "OVER_PROMISED_STOCK" | "OVER_CONFIRMED_ORDER" | "COUNTER_DRIFT";
   label: string;
   promised: number;
   limit: number;
 };
 
 /**
- * The integrity check. Both lists must always be empty:
- *  1. a farm + variety whose confirmed allocations exceed its logged stock,
- *  2. an order confirmed for more than it asked for.
- * This reads the live tables rather than any counter, so it catches a broken
- * invariant however it happened.
+ * The integrity check. All three lists must always be empty:
+ *  1. a farm + variety whose allocated stems exceed its logged stock,
+ *  2. an order confirmed for more than it asked for,
+ *  3. a variety whose allocated counter disagrees with the confirmed requests
+ *     it is derived from.
+ *
+ * The third case matters on MongoDB specifically: `allocated` is a counter
+ * guarding the invariant, so this re-derives it from the requests themselves
+ * and shouts if the two ever drift apart.
  */
 export async function findDuplicatePromises(): Promise<DuplicatePromise[]> {
-  const overStock = await db.$queryRaw<
-    { farm: string; variety: string; promised: number; stock: number }[]
-  >`
-    SELECT f.name AS farm, v.name AS variety,
-           COALESCE(a.allocated, 0)::int AS promised,
-           COALESCE(s.quantity, 0)::int AS stock
-    FROM "Variety" v
-    JOIN "Organization" f ON f.id = v."farmId"
-    LEFT JOIN LATERAL (
-      SELECT quantity FROM "StockEntry"
-      WHERE "varietyId" = v.id ORDER BY "loggedAt" DESC LIMIT 1
-    ) s ON TRUE
-    LEFT JOIN LATERAL (
-      SELECT SUM(ar."confirmedQty") AS allocated
-      FROM "AllocationRequest" ar
-      JOIN "Order" o ON o.id = ar."orderId"
-      WHERE ar."varietyId" = v.id AND o.status <> 'FULFILLED'
-    ) a ON TRUE
-    WHERE COALESCE(a.allocated, 0) > COALESCE(s.quantity, 0)`;
+  const [varieties, requests, orders] = await Promise.all([
+    db.variety.findMany({ include: { farm: { select: { name: true } } } }),
+    db.allocationRequest.findMany({
+      where: { confirmedQty: { gt: 0 } },
+      select: { varietyId: true, orderId: true, confirmedQty: true },
+    }),
+    db.order.findMany({ select: { id: true, status: true, quantity: true, buyerName: true, varietyName: true } }),
+  ]);
 
-  const overOrder = await db.$queryRaw<
-    { buyer: string; variety: string; promised: number; ordered: number }[]
-  >`
-    SELECT o."buyerName" AS buyer, o."varietyName" AS variety,
-           SUM(ar."confirmedQty")::int AS promised, o.quantity::int AS ordered
-    FROM "Order" o
-    JOIN "AllocationRequest" ar ON ar."orderId" = o.id
-    GROUP BY o.id, o."buyerName", o."varietyName", o.quantity
-    HAVING SUM(ar."confirmedQty") > o.quantity`;
+  const orderById = new Map(orders.map((o) => [o.id, o]));
+  const found: DuplicatePromise[] = [];
 
-  return [
-    ...overStock.map((r) => ({
-      kind: "OVER_PROMISED_STOCK" as const,
-      label: `${r.farm} · ${r.variety}`,
-      promised: r.promised,
-      limit: r.stock,
-    })),
-    ...overOrder.map((r) => ({
-      kind: "OVER_CONFIRMED_ORDER" as const,
-      label: `${r.buyer} · ${r.variety}`,
-      promised: r.promised,
-      limit: r.ordered,
-    })),
-  ];
+  // Confirmed stems per variety, counting only orders that aren't fulfilled.
+  const derived = new Map<string, number>();
+  for (const r of requests) {
+    if (orderById.get(r.orderId)?.status === "FULFILLED") continue;
+    derived.set(r.varietyId, (derived.get(r.varietyId) ?? 0) + r.confirmedQty);
+  }
+
+  for (const v of varieties) {
+    const label = `${v.farm.name} · ${v.name}`;
+    if (v.allocated > v.stock) {
+      found.push({ kind: "OVER_PROMISED_STOCK", label, promised: v.allocated, limit: v.stock });
+    }
+    const fromRequests = derived.get(v.id) ?? 0;
+    if (fromRequests !== v.allocated) {
+      found.push({ kind: "COUNTER_DRIFT", label, promised: v.allocated, limit: fromRequests });
+    }
+  }
+
+  // Confirmed stems per order.
+  const perOrder = new Map<string, number>();
+  for (const r of requests) perOrder.set(r.orderId, (perOrder.get(r.orderId) ?? 0) + r.confirmedQty);
+  for (const [orderId, confirmed] of perOrder) {
+    const order = orderById.get(orderId);
+    if (order && confirmed > order.quantity) {
+      found.push({
+        kind: "OVER_CONFIRMED_ORDER",
+        label: `${order.buyerName} · ${order.varietyName}`,
+        promised: confirmed,
+        limit: order.quantity,
+      });
+    }
+  }
+
+  return found;
 }
 
 export async function getMetrics(): Promise<Metrics> {
-  const [
-    timings,
-    rates,
-    orders,
-    farms,
-    exporters,
-    ordersTotal,
-    ordersCompleted,
-    duplicatePromises,
-  ] = await Promise.all([
-    // Request sent -> farm answered, in minutes.
-    db.$queryRaw<{ avg_minutes: number | null }[]>`
-      SELECT AVG(EXTRACT(EPOCH FROM ("respondedAt" - "requestedAt")) / 60) AS avg_minutes
-      FROM "AllocationRequest" WHERE "respondedAt" IS NOT NULL`,
-    // Answered within 30 minutes. Requests that expired count as misses.
-    db.$queryRaw<{ within: number; total: number }[]>`
-      SELECT
-        COUNT(*) FILTER (
-          WHERE "respondedAt" IS NOT NULL
-          AND "respondedAt" - "requestedAt" <= INTERVAL '30 minutes'
-        )::int AS within,
-        COUNT(*) FILTER (WHERE status <> 'PENDING')::int AS total
-      FROM "AllocationRequest"`,
-    // Delivered vs confirmed, per fulfilled order.
-    db.$queryRaw<{ confirmed: number; delivered: number }[]>`
-      SELECT SUM(ar."confirmedQty")::int AS confirmed, o."deliveredQuantity"::int AS delivered
-      FROM "Order" o
-      JOIN "AllocationRequest" ar ON ar."orderId" = o.id
-      WHERE o.status = 'FULFILLED' AND o."deliveredQuantity" IS NOT NULL
-      GROUP BY o.id, o."deliveredQuantity"
-      HAVING SUM(ar."confirmedQty") > 0`,
-    db.organization.count({ where: { type: "FARM" } }),
-    db.organization.count({ where: { type: "EXPORTER" } }),
-    db.order.count(),
-    db.order.count({ where: { status: "FULFILLED" } }),
-    findDuplicatePromises(),
-  ]);
+  const [answered, allRequests, fulfilledOrders, farms, exporters, ordersTotal, ordersCompleted, duplicatePromises] =
+    await Promise.all([
+      db.allocationRequest.findMany({
+        where: { respondedAt: { not: null } },
+        select: { requestedAt: true, respondedAt: true },
+      }),
+      db.allocationRequest.findMany({ where: { status: { not: "PENDING" } }, select: { id: true } }),
+      db.order.findMany({
+        where: { status: "FULFILLED", deliveredQuantity: { not: null } },
+        select: { id: true, deliveredQuantity: true, requests: { select: { confirmedQty: true } } },
+      }),
+      db.organization.count({ where: { type: "FARM" } }),
+      db.organization.count({ where: { type: "EXPORTER" } }),
+      db.order.count(),
+      db.order.count({ where: { status: "FULFILLED" } }),
+      findDuplicatePromises(),
+    ]);
 
-  const { within, total } = rates[0];
+  const minutes = answered.map((r) => (r.respondedAt!.getTime() - r.requestedAt.getTime()) / 60_000);
+  const within30 = minutes.filter((m) => m <= 30).length;
+  const answeredOrExpired = allRequests.length;
+
   // Accuracy penalises delivering less or more than was confirmed.
-  const accuracies = orders.map((o) =>
-    Math.max(0, 1 - Math.abs(o.delivered - o.confirmed) / o.confirmed),
-  );
+  const accuracies = fulfilledOrders
+    .map((o) => ({ confirmed: o.requests.reduce((s, r) => s + r.confirmedQty, 0), delivered: o.deliveredQuantity! }))
+    .filter((o) => o.confirmed > 0)
+    .map((o) => Math.max(0, 1 - Math.abs(o.delivered - o.confirmed) / o.confirmed));
 
   return {
-    avgConfirmationMinutes:
-      timings[0].avg_minutes === null ? null : Number(timings[0].avg_minutes),
-    responseRate30: total === 0 ? null : (within / total) * 100,
-    respondedWithin30: within,
-    answeredOrExpired: total,
+    avgConfirmationMinutes: minutes.length === 0 ? null : minutes.reduce((a, b) => a + b, 0) / minutes.length,
+    responseRate30: answeredOrExpired === 0 ? null : (within30 / answeredOrExpired) * 100,
+    respondedWithin30: within30,
+    answeredOrExpired,
     fulfillmentAccuracy:
-      accuracies.length === 0
-        ? null
-        : (accuracies.reduce((a, b) => a + b, 0) / accuracies.length) * 100,
+      accuracies.length === 0 ? null : (accuracies.reduce((a, b) => a + b, 0) / accuracies.length) * 100,
     ordersCompleted,
     ordersTotal,
     farmsRegistered: farms,

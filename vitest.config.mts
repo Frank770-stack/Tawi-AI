@@ -12,6 +12,9 @@ export default defineConfig({
     env: { DATABASE_URL: env.TEST_DATABASE_URL, SMS_MODE: "console" },
     globalSetup: ["tests/global-setup.ts"],
     fileParallelism: false, // tests share one database
-    testTimeout: 30_000,
+    // The test database is MongoDB Atlas: every operation is a network round
+    // trip, so these are generous compared with a local database.
+    testTimeout: 60_000,
+    hookTimeout: 60_000,
   },
 });

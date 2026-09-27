@@ -30,9 +30,17 @@ const EXPORTERS = [
 ];
 
 async function reset() {
-  await db.$executeRawUnsafe(`
-    TRUNCATE "Notification", "AllocationRequest", "Order", "StockEntry", "Variety",
-             "Session", "OtpCode", "User", "Organization", "AccessRequest" CASCADE`);
+  // Children before parents: Prisma enforces relations on MongoDB too.
+  await db.notification.deleteMany();
+  await db.allocationRequest.deleteMany();
+  await db.order.deleteMany();
+  await db.stockEntry.deleteMany();
+  await db.variety.deleteMany();
+  await db.session.deleteMany();
+  await db.otpCode.deleteMany();
+  await db.user.deleteMany();
+  await db.organization.deleteMany();
+  await db.accessRequest.deleteMany();
   console.log("Cleared existing data.");
 }
 
@@ -59,7 +67,9 @@ async function main() {
     });
 
     for (const [variety, quantity] of Object.entries(farm.stock)) {
-      const v = await db.variety.create({ data: { farmId: org.id, name: variety } });
+      const v = await db.variety.create({
+        data: { farmId: org.id, name: variety, stock: quantity, archivedAt: null },
+      });
       await db.stockEntry.create({
         data: {
           farmId: org.id,
