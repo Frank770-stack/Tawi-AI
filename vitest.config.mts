@@ -9,7 +9,8 @@ if (!env.TEST_DATABASE_URL) throw new Error("Set TEST_DATABASE_URL (see README)"
 export default defineConfig({
   resolve: { alias: { "@": path.resolve(import.meta.dirname, "src") } },
   test: {
-    env: { DATABASE_URL: env.TEST_DATABASE_URL, SMS_MODE: "console" },
+    // Fixed values, so a developer's .env can't change what the tests mean.
+    env: { DATABASE_URL: env.TEST_DATABASE_URL, SMS_MODE: "console", SHOW_OTP_ON_SCREEN: "" },
     globalSetup: ["tests/global-setup.ts"],
     fileParallelism: false, // tests share one database
     // The test database is MongoDB Atlas: every operation is a network round

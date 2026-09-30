@@ -38,6 +38,15 @@ export function LoginForm() {
       <p className="text-muted">
         Code sent to <strong className="text-ink">{formatPhone(state.phone!)}</strong>
       </p>
+
+      {/* Testing aid, only when SHOW_OTP_ON_SCREEN is on. Never for real users. */}
+      {state.devCode && (
+        <div className="rounded-xl border-2 border-dashed border-warn bg-warn-50 px-4 py-3">
+          <p className="text-sm font-bold text-warn">Test mode — no SMS sent</p>
+          <p className="mt-1 font-mono text-3xl font-bold tracking-[0.2em] text-ink">{state.devCode}</p>
+          <p className="mt-1 text-sm text-muted">Already filled in below. Just tap Log in.</p>
+        </div>
+      )}
       <Field label="6-digit code">
         <Input
           name="code"
@@ -47,6 +56,7 @@ export function LoginForm() {
           pattern="[0-9 ]*"
           maxLength={7}
           placeholder="123456"
+          defaultValue={state.devCode ?? ""}
           className="text-center text-2xl tracking-[0.4em]"
           autoFocus
         />

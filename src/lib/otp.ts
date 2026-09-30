@@ -11,7 +11,21 @@ function hashCode(phone: string, code: string) {
   return createHash("sha256").update(`${phone}:${code}`).digest("hex");
 }
 
-export type RequestOtpResult = { ok: true } | { ok: false; error: string };
+/**
+ * Whether to hand the code back to the browser so it can be shown on screen.
+ *
+ * Testing aid only, for before SMS is wired up. Anyone who knows a phone
+ * number can then log in as that organization, so it is off unless
+ * SHOW_OTP_ON_SCREEN is exactly "true", and it is ignored outright whenever
+ * real SMS is configured. Never enable it on a deployment real users can reach.
+ */
+export function showOtpOnScreen() {
+  return process.env.SHOW_OTP_ON_SCREEN === "true" && process.env.SMS_MODE !== "africastalking";
+}
+
+export type RequestOtpResult =
+  | { ok: true; devCode?: string }
+  | { ok: false; error: string };
 
 /** `phone` must already be normalised to +254. */
 export async function requestOtp(
@@ -34,7 +48,7 @@ export async function requestOtp(
     },
   });
   await sender.send(phone, `Your Tawi login code is ${code}. It expires in 5 minutes.`);
-  return { ok: true };
+  return showOtpOnScreen() ? { ok: true, devCode: code } : { ok: true };
 }
 
 export type VerifyOtpResult = { ok: true } | { ok: false; error: string };

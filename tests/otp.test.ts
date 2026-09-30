@@ -1,6 +1,6 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { db } from "@/lib/db";
-import { OTP_MAX_ATTEMPTS, OTP_RATE_LIMIT, requestOtp, verifyOtp } from "@/lib/otp";
+import { OTP_MAX_ATTEMPTS, OTP_RATE_LIMIT, requestOtp, showOtpOnScreen, verifyOtp } from "@/lib/otp";
 import type { SmsSender } from "@/lib/sms";
 import { resetDb } from "./helpers";
 
@@ -74,5 +74,39 @@ describe("OTP", () => {
     expect(await requestOtp(phone, sms.sender)).toMatchObject({ ok: false, error: expect.stringMatching(/too many/i) });
     // A different phone is not affected.
     expect((await requestOtp("+254722000000", sms.sender)).ok).toBe(true);
+  });
+});
+
+describe("showing the code on screen (testing aid)", () => {
+  const original = { show: process.env.SHOW_OTP_ON_SCREEN, mode: process.env.SMS_MODE };
+  afterEach(() => {
+    process.env.SHOW_OTP_ON_SCREEN = original.show;
+    process.env.SMS_MODE = original.mode;
+  });
+
+  it("is off unless SHOW_OTP_ON_SCREEN is exactly true", async () => {
+    const sms = fakeSender();
+    for (const value of [undefined, "", "false", "1", "yes", "TRUE"]) {
+      if (value === undefined) delete process.env.SHOW_OTP_ON_SCREEN;
+      else process.env.SHOW_OTP_ON_SCREEN = value;
+      await db.otpCode.deleteMany();
+      expect(await requestOtp(phone, sms.sender)).toEqual({ ok: true });
+    }
+  });
+
+  it("returns the code when switched on", async () => {
+    process.env.SHOW_OTP_ON_SCREEN = "true";
+    process.env.SMS_MODE = "console";
+    const sms = fakeSender();
+    const result = await requestOtp(phone, sms.sender);
+    expect(result).toEqual({ ok: true, devCode: sms.lastCode() });
+  });
+
+  it("never returns the code once real SMS is configured", async () => {
+    process.env.SHOW_OTP_ON_SCREEN = "true";
+    process.env.SMS_MODE = "africastalking";
+    const sms = fakeSender();
+    expect(await requestOtp(phone, sms.sender)).toEqual({ ok: true });
+    expect(showOtpOnScreen()).toBe(false);
   });
 });

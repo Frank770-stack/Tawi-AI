@@ -24,6 +24,17 @@ npm run dev                 # http://localhost:3000
 In dev mode (`SMS_MODE=console`), login codes are printed in the terminal running
 `npm run dev`, e.g. `[SMS to +254712345678] Your Tawi login code is 123456.`
 
+### Logging in before SMS is wired up
+
+Set `SHOW_OTP_ON_SCREEN="true"` and the login screen shows the code and fills it
+in for you, so you can test without reading server logs.
+
+**This is an auth bypass.** Anyone who knows a phone number can log in as that
+organization. Leave it unset on anything real users can reach, and switch to
+`SMS_MODE=africastalking` before the pilot. The flag is ignored whenever
+`SMS_MODE` is `africastalking`, so real SMS and on-screen codes can never be on
+at the same time.
+
 ## Environment variables
 
 | Variable | Purpose |
@@ -31,6 +42,7 @@ In dev mode (`SMS_MODE=console`), login codes are printed in the terminal runnin
 | `DATABASE_URL` | MongoDB Atlas connection string, including the database name (`/tawi`). |
 | `TEST_DATABASE_URL` | A **separate** database for tests. Tests wipe it. |
 | `SMS_MODE` | `console` (default, logs the OTP) or `africastalking` (sends real SMS). |
+| `SHOW_OTP_ON_SCREEN` | `true` also shows the login code on the login screen. **Testing only** (see below). |
 | `AFRICASTALKING_USERNAME` | Africa's Talking username. `sandbox` uses the sandbox API. |
 | `AFRICASTALKING_API_KEY` | Africa's Talking API key. |
 | `AFRICASTALKING_SENDER_ID` | Optional registered sender ID / shortcode. |

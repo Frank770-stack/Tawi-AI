@@ -13,6 +13,8 @@ export type LoginState = {
   rawPhone?: string;
   error?: string;
   info?: string;
+  /** Only set when SHOW_OTP_ON_SCREEN is on: see showOtpOnScreen(). */
+  devCode?: string;
 };
 
 /** One action for the whole login form; `intent` says which button was pressed. */
@@ -29,7 +31,12 @@ export async function loginAction(_prev: LoginState, formData: FormData): Promis
     }
     const result = await requestOtp(phone);
     if (!result.ok) return { step: intent === "resend" ? "code" : "phone", phone, error: result.error };
-    return { step: "code", phone, info: intent === "resend" ? "New code sent." : undefined };
+    return {
+      step: "code",
+      phone,
+      devCode: result.devCode,
+      info: intent === "resend" ? "New code sent." : undefined,
+    };
   }
 
   if (intent === "verify") {
